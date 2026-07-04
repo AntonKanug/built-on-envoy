@@ -32,16 +32,23 @@ longDescription: |
 
   ## Frontend
 
-  A small `xterm.js` client is bundled but is not served by default — the
+  A small `xterm.js` client is bundled and served by default — the
   endpoints above are the primary interface, so bring your own client (e.g. an
-  application's own terminal view). Set `serve_frontend: true` to serve the
+  application's own terminal view). Set `serve_frontend: false` to disable the
   bundled client at `/`.
 
   ## Security
 
-  A browser terminal is remote code execution by design, and this extension has
-  no built-in authentication — restrict access to the listener (network policy or
-  an auth filter earlier in the chain) before exposing it.
+  A browser terminal is remote code execution by design — do not expose it
+  without protection. Set `basic_auth` to require a login: the browser shows
+  its native login dialog before any endpoint can be used. Define users with
+  a simple `users` name-to-password map, an htpasswd file (`htpasswd -B`), or
+  both. Passwords in the `users` map are plaintext in the config, so prefer
+  an htpasswd file when the config may be seen by others.
+
+  Use TLS in front of the listener, as Basic auth sends credentials with
+  every request. Without `basic_auth`, restrict access to the listener
+  (network policy or an auth filter earlier in the chain) before exposing it.
 type: go
 tags:
   - go
@@ -51,20 +58,40 @@ tags:
   - sse
 license: Apache-2.0
 examples:
-  - title: API only (default), bring your own client
+  - title: Serve the bundled xterm.js client (default)
     description: |
-      Drive the /stream, /input and /resize endpoints from your own client. The
-      bundled frontend is not served.
-    code: |
-      boe run --extension web-terminal --config '{
-        "command": "/bin/bash"
-      }'
-  - title: Serve the bundled xterm.js client
-    description: |
-      Enable the bundled frontend, then open it in the browser at
+      The bundled frontend is served by default; open it in the browser at
       http://localhost:10000/
     code: |
+      boe run --extension web-terminal
+  - title: API only, bring your own client and custom shell command
+    description: |
+      Disable the bundled frontend and drive the /stream, /input and /resize
+      endpoints from your own client. Also use a custom shell command
+    code: |
       boe run --extension web-terminal --config '{
-        "command": "/bin/bash",
-        "serve_frontend": true
+        "command": "/bin/sh",
+        "serve_frontend": false
+      }'
+  - title: Require a login (HTTP Basic auth)
+    description: |
+      Protect all endpoints with a quick inline user map; the browser shows its
+      native login dialog. Passwords here are plaintext — for hashed
+      credentials use an htpasswd file instead.
+    code: |
+      boe run --extension web-terminal --config '{
+        "basic_auth": {
+          "users": { "admin": "secret" }
+        }
+      }'
+  - title: Require a login from an htpasswd file
+    description: |
+      Load hashed credentials from an existing htpasswd file. Create one with
+      `htpasswd -cB /etc/envoy/htpasswd admin` (bcrypt and passlib
+      PBKDF2-SHA256 entries are supported); the file is read once at startup.
+    code: |
+      boe run --extension web-terminal --config '{
+        "basic_auth": {
+          "htpasswd": { "file": "/etc/envoy/htpasswd" }
+        }
       }'

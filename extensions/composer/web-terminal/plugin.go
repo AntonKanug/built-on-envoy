@@ -14,18 +14,32 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared"
+
+	"github.com/tetratelabs/built-on-envoy/extensions/composer/pkg"
 )
 
 const extensionName = "web-terminal"
 
+// defaultRealm is the realm presented in the browser's login prompt when the
+// config does not set one.
+const defaultRealm = "web-terminal"
+
+type basicAuthConfig struct {
+	Htpasswd *pkg.DataSource   `json:"htpasswd"`
+	Users    map[string]string `json:"users"`
+	Realm    string            `json:"realm"`
+}
+
 type terminalConfig struct {
-	Command       string   `json:"command"`
-	Args          []string `json:"args"`
-	Writable      bool     `json:"writable"`
-	ServeFrontend bool     `json:"serve_frontend"`
+	Command       string           `json:"command"`
+	Args          []string         `json:"args"`
+	Writable      bool             `json:"writable"`
+	ServeFrontend *bool            `json:"serve_frontend"`
+	BasicAuth     *basicAuthConfig `json:"basic_auth"`
 }
 
 func parseConfig(raw []byte) (*terminalConfig, error) {
@@ -37,6 +51,23 @@ func parseConfig(raw []byte) (*terminalConfig, error) {
 	}
 	if cfg.Command == "" {
 		return nil, fmt.Errorf("invalid config: command must not be empty")
+	}
+	if cfg.BasicAuth != nil {
+		if cfg.BasicAuth.Htpasswd == nil && len(cfg.BasicAuth.Users) == 0 {
+			return nil, fmt.Errorf("invalid config: basic_auth requires 'htpasswd' or 'users'")
+		}
+		if cfg.BasicAuth.Htpasswd != nil {
+			if err := cfg.BasicAuth.Htpasswd.Validate(); err != nil {
+				return nil, fmt.Errorf("invalid 'basic_auth.htpasswd' configuration: %w", err)
+			}
+		}
+		if cfg.BasicAuth.Realm == "" {
+			cfg.BasicAuth.Realm = defaultRealm
+		}
+		// The realm is interpolated into a quoted WWW-Authenticate value.
+		if strings.ContainsAny(cfg.BasicAuth.Realm, `"\`) {
+			return nil, fmt.Errorf("invalid config: realm must not contain '\"' or '\\'")
+		}
 	}
 	return cfg, nil
 }
@@ -53,6 +84,7 @@ type terminalFilter struct {
 	cfg    *terminalConfig
 	handle shared.HttpFilterHandle
 	reg    *registry
+	auth   *authenticator
 
 	act     action
 	sid     string
@@ -62,6 +94,17 @@ type terminalFilter struct {
 }
 
 func (f *terminalFilter) OnRequestHeaders(headers shared.HeaderMap, endOfStream bool) shared.HeadersStatus {
+	// The auth gate runs before any routing so every endpoint, including
+	// unknown paths, challenges the browser. The unsafe header view is only
+	// used synchronously inside authenticate.
+	if f.auth != nil && !f.auth.authenticate(headers.GetOne("authorization").ToUnsafeString()) {
+		f.handle.SendLocalResponse(401, [][2]string{
+			{"content-type", "text/plain"},
+			{"www-authenticate", `Basic realm="` + f.auth.realm + `", charset="UTF-8"`},
+		}, []byte("Unauthorized"), "web_terminal_unauthorized")
+		return shared.HeadersStatusStopAllAndBuffer
+	}
+
 	u, err := url.Parse(headers.GetOne(":path").ToUnsafeString())
 	if err != nil {
 		f.sendPlain(400, "Bad Request", "web_terminal_bad_path")
@@ -73,7 +116,7 @@ func (f *terminalFilter) OnRequestHeaders(headers shared.HeaderMap, endOfStream 
 	switch u.Path {
 	case "/", "/index.html":
 		switch {
-		case !f.cfg.ServeFrontend:
+		case f.cfg.ServeFrontend != nil && !*f.cfg.ServeFrontend:
 			f.sendPlain(404, "Not Found", "web_terminal_frontend_disabled")
 		case method != "GET":
 			f.sendPlain(405, "Method Not Allowed", "web_terminal_method")
@@ -216,12 +259,13 @@ func parseDim(s string, def uint16) uint16 {
 
 type filterFactory struct {
 	shared.EmptyHttpFilterFactory
-	cfg *terminalConfig
-	reg *registry
+	cfg  *terminalConfig
+	reg  *registry
+	auth *authenticator
 }
 
 func (f *filterFactory) Create(handle shared.HttpFilterHandle) shared.HttpFilter {
-	return &terminalFilter{cfg: f.cfg, handle: handle, reg: f.reg}
+	return &terminalFilter{cfg: f.cfg, handle: handle, reg: f.reg, auth: f.auth}
 }
 
 type configFactory struct {
@@ -234,7 +278,14 @@ func (f *configFactory) Create(handle shared.HttpFilterConfigHandle, unparsed []
 		handle.Log(shared.LogLevelError, "web-terminal: %s", err.Error())
 		return nil, err
 	}
-	return &filterFactory{cfg: cfg, reg: newRegistry()}, nil
+	var auth *authenticator
+	if cfg.BasicAuth != nil {
+		if auth, err = newAuthenticator(cfg.BasicAuth); err != nil {
+			handle.Log(shared.LogLevelError, "web-terminal: %s", err.Error())
+			return nil, err
+		}
+	}
+	return &filterFactory{cfg: cfg, reg: newRegistry(), auth: auth}, nil
 }
 
 func (f *configFactory) CreatePerRoute(_ []byte) (any, error) { return nil, nil }

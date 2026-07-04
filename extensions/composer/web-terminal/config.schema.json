@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/tetratelabs/built-on-envoy/extensions/composer/web-terminal/config.schema.json",
   "title": "Web Terminal Configuration",
-  "description": "Configuration for the web-terminal extension. Streams a PTY to the browser over SSE and takes input via POST. A browser terminal is remote code execution by design: set a token unless the listener is otherwise protected.",
+  "description": "Configuration for the web-terminal extension. Streams a PTY to the browser over SSE and takes input via POST. A browser terminal is remote code execution by design: configure basic_auth or protect the listener otherwise before exposing it.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -24,8 +24,57 @@
     },
     "serve_frontend": {
       "type": "boolean",
-      "description": "Whether to serve the bundled xterm.js client at \"/\". Disabled by default; the /stream, /input and /resize endpoints are the primary interface. Set to true to serve the bundled client.",
-      "default": false
+      "description": "Whether to serve the bundled xterm.js client at \"/\". Enabled by default; set to false if you bring your own client for the /stream, /input and /resize endpoints.",
+      "default": true
+    },
+    "basic_auth": {
+      "type": "object",
+      "description": "Optional HTTP Basic authentication. When set, every endpoint (including / and /stream) requires credentials from the htpasswd data and/or the users map, and browsers show their native login dialog. Absent = no authentication.",
+      "additionalProperties": false,
+      "anyOf": [
+        { "required": ["htpasswd"] },
+        { "required": ["users"] }
+      ],
+      "properties": {
+        "htpasswd": {
+          "$ref": "#/$defs/DataSource",
+          "description": "htpasswd entries, one 'user:hash' per line. Supported hashes: bcrypt ($2a$/$2b$/$2y$, e.g. from 'htpasswd -B') and PBKDF2-SHA256 in passlib format ($pbkdf2-sha256$...). Blank lines and '#' comments are ignored."
+        },
+        "users": {
+          "type": "object",
+          "description": "Users as a name-to-plaintext-password map, for quick setups where hashing is not worth the ceremony. Merged with the htpasswd entries; a user may only be defined in one of the two. Prefer 'htpasswd' when the config may be seen by others.",
+          "minProperties": 1,
+          "additionalProperties": { "type": "string", "minLength": 1 },
+          "propertyNames": { "pattern": "^[^:]+$" }
+        },
+        "realm": {
+          "type": "string",
+          "description": "Realm shown in the browser's login prompt.",
+          "default": "web-terminal",
+          "pattern": "^[^\"\\\\]*$"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "DataSource": {
+      "type": "object",
+      "description": "A data source provided either inline or as a file path. Exactly one must be set.",
+      "additionalProperties": false,
+      "properties": {
+        "inline": {
+          "type": "string",
+          "description": "Data provided directly as a string."
+        },
+        "file": {
+          "type": "string",
+          "description": "Path to a file containing the data."
+        }
+      },
+      "oneOf": [
+        { "required": ["inline"] },
+        { "required": ["file"] }
+      ]
     }
   }
 }

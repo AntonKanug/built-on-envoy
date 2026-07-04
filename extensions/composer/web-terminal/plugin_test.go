@@ -39,24 +39,127 @@ func headerMap(method, path string) shared.HeaderMap {
 	return fake.NewFakeHeaderMap(map[string][]string{":method": {method}, ":path": {path}})
 }
 
+func headerMapWithAuth(method, path, authorization string) shared.HeaderMap {
+	headers := map[string][]string{":method": {method}, ":path": {path}}
+	if authorization != "" {
+		headers["authorization"] = []string{authorization}
+	}
+	return fake.NewFakeHeaderMap(headers)
+}
+
 func TestParseConfig(t *testing.T) {
 	cfg, err := parseConfig(nil)
 	require.NoError(t, err)
 	require.Equal(t, "/bin/bash", cfg.Command)
 	require.True(t, cfg.Writable)
-	require.False(t, cfg.ServeFrontend) // frontend off by default
+	require.Nil(t, cfg.ServeFrontend) // frontend on by default
 
 	cfg, err = parseConfig([]byte(`{"command":"sh","args":["-c","x"],"writable":false,"serve_frontend":true}`))
 	require.NoError(t, err)
 	require.Equal(t, "sh", cfg.Command)
 	require.Equal(t, []string{"-c", "x"}, cfg.Args)
 	require.False(t, cfg.Writable)
-	require.True(t, cfg.ServeFrontend)
+	require.NotNil(t, cfg.ServeFrontend)
+	require.True(t, *cfg.ServeFrontend)
 
 	_, err = parseConfig([]byte(`{`))
 	require.Error(t, err)
 	_, err = parseConfig([]byte(`{"command":""}`))
 	require.Error(t, err)
+}
+
+func TestParseConfigBasicAuth(t *testing.T) {
+	cfg, err := parseConfig(nil)
+	require.NoError(t, err)
+	require.Nil(t, cfg.BasicAuth) // auth off by default
+
+	cfg, err = parseConfig([]byte(`{"basic_auth":{"htpasswd":{"inline":"a:b"}}}`))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.BasicAuth)
+	require.Equal(t, defaultRealm, cfg.BasicAuth.Realm)
+
+	cfg, err = parseConfig([]byte(`{"basic_auth":{"htpasswd":{"file":"/x"},"realm":"ops"}}`))
+	require.NoError(t, err)
+	require.Equal(t, "ops", cfg.BasicAuth.Realm)
+
+	// A plain users map works without htpasswd, and both can be combined.
+	cfg, err = parseConfig([]byte(`{"basic_auth":{"users":{"admin":"secret"}}}`))
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"admin": "secret"}, cfg.BasicAuth.Users)
+	_, err = parseConfig([]byte(`{"basic_auth":{"htpasswd":{"file":"/x"},"users":{"admin":"secret"}}}`))
+	require.NoError(t, err)
+
+	// At least one of htpasswd/users is required, and htpasswd must set
+	// exactly one of inline/file.
+	_, err = parseConfig([]byte(`{"basic_auth":{}}`))
+	require.Error(t, err)
+	_, err = parseConfig([]byte(`{"basic_auth":{"htpasswd":{}}}`))
+	require.Error(t, err)
+	_, err = parseConfig([]byte(`{"basic_auth":{"htpasswd":{"inline":"a:b","file":"/x"}}}`))
+	require.Error(t, err)
+
+	// The realm is embedded in a quoted header value.
+	_, err = parseConfig([]byte(`{"basic_auth":{"htpasswd":{"inline":"a:b"},"realm":"o\"ps"}}`))
+	require.Error(t, err)
+	_, err = parseConfig([]byte(`{"basic_auth":{"htpasswd":{"inline":"a:b"},"realm":"o\\ps"}}`))
+	require.Error(t, err)
+}
+
+func TestAuthRequiredAllEndpoints(t *testing.T) {
+	auth := testAuthenticator(t, "admin:"+minCostHash(t, "secret"))
+	endpoints := []struct{ method, path string }{
+		{"GET", "/"},
+		{"GET", "/index.html"},
+		{"GET", "/stream?sid=a"},
+		{"POST", "/input?sid=a"},
+		{"POST", "/resize?sid=a"},
+		{"GET", "/nope"},
+	}
+	for _, creds := range []string{"", basicHeader("admin:wrong"), basicHeader("nobody:secret"), "Bearer tok"} {
+		for _, ep := range endpoints {
+			t.Run(ep.method+" "+ep.path+" creds="+creds, func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				h := newHandle(ctrl)
+				var headers [][2]string
+				h.EXPECT().SendLocalResponse(uint32(401), gomock.Any(), gomock.Any(), "web_terminal_unauthorized").
+					Do(func(_ uint32, hs [][2]string, _ []byte, _ string) { headers = hs })
+
+				f := &terminalFilter{cfg: &terminalConfig{Command: "cat", Writable: true}, handle: h, reg: newRegistry(), auth: auth}
+				require.Equal(t, shared.HeadersStatusStopAllAndBuffer,
+					f.OnRequestHeaders(headerMapWithAuth(ep.method, ep.path, creds), true))
+				require.Contains(t, headers, [2]string{"www-authenticate", `Basic realm="web-terminal", charset="UTF-8"`})
+			})
+		}
+	}
+}
+
+func TestAuthRejectedInputNeverReachesPTY(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	h := newHandle(ctrl)
+	h.EXPECT().SendLocalResponse(uint32(401), gomock.Any(), gomock.Any(), "web_terminal_unauthorized")
+
+	f := &terminalFilter{
+		cfg: &terminalConfig{Command: "cat", Writable: true}, handle: h, reg: newRegistry(),
+		auth: testAuthenticator(t, "admin:"+minCostHash(t, "secret")),
+	}
+	require.Equal(t, shared.HeadersStatusStopAllAndBuffer,
+		f.OnRequestHeaders(headerMapWithAuth("POST", "/input?sid=a", ""), false))
+	// The 401 left act unset, so a straggling body is passed through untouched.
+	require.Equal(t, actionNone, f.act)
+	require.Equal(t, shared.BodyStatusContinue, f.OnRequestBody(fake.NewFakeBodyBuffer([]byte("x")), true))
+}
+
+func TestAuthSuccessReachesRouting(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	h := newHandle(ctrl)
+	h.EXPECT().SendLocalResponse(uint32(404), gomock.Any(), gomock.Any(), "web_terminal_frontend_disabled")
+
+	f := &terminalFilter{
+		cfg: &terminalConfig{Command: "cat", Writable: true, ServeFrontend: new(false)}, handle: h,
+		reg: newRegistry(), auth: testAuthenticator(t, "admin:"+minCostHash(t, "secret")),
+	}
+	require.Equal(t, shared.HeadersStatusStopAllAndBuffer,
+		f.OnRequestHeaders(headerMapWithAuth("GET", "/", basicHeader("admin:secret")), true))
 }
 
 func TestFrontendServedWhenEnabled(t *testing.T) {
@@ -66,17 +169,27 @@ func TestFrontendServedWhenEnabled(t *testing.T) {
 	h.EXPECT().SendResponseHeaders(gomock.Any(), false)
 	h.EXPECT().SendResponseData(gomock.Any(), true).Do(func(b []byte, _ bool) { body = b })
 
-	f := &terminalFilter{cfg: &terminalConfig{Command: "cat", Writable: true, ServeFrontend: true}, handle: h, reg: newRegistry()}
+	f := &terminalFilter{cfg: &terminalConfig{Command: "cat", Writable: true, ServeFrontend: new(true)}, handle: h, reg: newRegistry()}
 	require.Equal(t, shared.HeadersStatusStopAllAndBuffer, f.OnRequestHeaders(headerMap("GET", "/"), true))
 	require.Contains(t, string(body), "xterm")
 }
 
-func TestFrontendDisabledByDefault(t *testing.T) {
+func TestFrontendServedByDefault(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	h := newHandle(ctrl)
+	h.EXPECT().SendResponseHeaders(gomock.Any(), false)
+	h.EXPECT().SendResponseData(gomock.Any(), true)
+
+	f := &terminalFilter{cfg: &terminalConfig{Command: "cat", Writable: true}, handle: h, reg: newRegistry()}
+	require.Equal(t, shared.HeadersStatusStopAllAndBuffer, f.OnRequestHeaders(headerMap("GET", "/"), true))
+}
+
+func TestFrontendDisabled(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	h := newHandle(ctrl)
 	h.EXPECT().SendLocalResponse(uint32(404), gomock.Any(), gomock.Any(), "web_terminal_frontend_disabled")
 
-	f := &terminalFilter{cfg: &terminalConfig{Command: "cat", Writable: true}, handle: h, reg: newRegistry()}
+	f := &terminalFilter{cfg: &terminalConfig{Command: "cat", Writable: true, ServeFrontend: new(false)}, handle: h, reg: newRegistry()}
 	require.Equal(t, shared.HeadersStatusStopAllAndBuffer, f.OnRequestHeaders(headerMap("GET", "/"), true))
 }
 
@@ -85,7 +198,8 @@ func TestFrontendWrongMethod(t *testing.T) {
 	h := newHandle(ctrl)
 	h.EXPECT().SendLocalResponse(uint32(405), gomock.Any(), gomock.Any(), "web_terminal_method")
 
-	f := &terminalFilter{cfg: &terminalConfig{Command: "cat", Writable: true, ServeFrontend: true}, handle: h, reg: newRegistry()}
+	f := &terminalFilter{cfg: &terminalConfig{Command: "cat", Writable: true, ServeFrontend: new(bool)}, handle: h, reg: newRegistry()}
+	*f.cfg.ServeFrontend = true
 	require.Equal(t, shared.HeadersStatusStopAllAndBuffer, f.OnRequestHeaders(headerMap("POST", "/"), true))
 }
 
@@ -236,6 +350,18 @@ func TestConfigFactory(t *testing.T) {
 
 	_, err = factory.Create(h, []byte(`{"command":""}`))
 	require.Error(t, err)
+
+	// Valid basic_auth builds an authenticator; bad htpasswd data fails config load.
+	ff, err = factory.Create(h, []byte(`{"command":"cat","basic_auth":{"htpasswd":{"inline":"admin:`+bcryptVector+`"}}}`))
+	require.NoError(t, err)
+	require.NotNil(t, ff.(*filterFactory).auth)
+	_, err = factory.Create(h, []byte(`{"command":"cat","basic_auth":{"htpasswd":{"inline":"just-garbage"}}}`))
+	require.Error(t, err)
+	_, err = factory.Create(h, []byte(`{"command":"cat","basic_auth":{"htpasswd":{"file":"/does/not/exist"}}}`))
+	require.Error(t, err)
+	ff, err = factory.Create(h, []byte(`{"command":"cat","basic_auth":{"users":{"admin":"secret"}}}`))
+	require.NoError(t, err)
+	require.NotNil(t, ff.(*filterFactory).auth)
 
 	perRoute, err := factory.CreatePerRoute([]byte(`{}`))
 	require.NoError(t, err)
